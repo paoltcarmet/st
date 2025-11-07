@@ -9,20 +9,26 @@ SERVICE="${SERVICE:-n4vpnssh}"
 
 CPU="${CPU:-2}"
 MEMORY="${MEMORY:-2Gi}"
-TIMEOUT="${TIMEOUT:-3600}"       # seconds
+TIMEOUT="${TIMEOUT:-3600}"          # seconds
 MIN_INSTANCES="${MIN_INSTANCES:-1}"
 PORT="${PORT:-8080}"
-
 WSPATH="${WSPATH:-/n4vpn}"
 
-# Telegram (provide via env when calling)
+# Duration from Start → End (default = 5 hours)
+DURATION_HOURS="${DURATION_HOURS:-5}"
+
+# Telegram (env required)
 TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 # ===== Helpers =====
 abort(){ echo "Error: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || abort "Missing dependency: $1"; }
-yangon_time(){ TZ="Asia/Yangon" date +"%I:%M %p, %d %b %Y (MMT)"; }
+
+# Time helpers (Asia/Yangon)
+yangon_now_epoch(){ TZ="Asia/Yangon" date +%s; }
+yangon_fmt_epoch(){ TZ="Asia/Yangon" date -d "@$1" "+%-I:%M %p,%-d.%-m.%Y(ASIA/YANGON)"; }
+
 html_escape(){ sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 tg_send(){
@@ -30,69 +36,78 @@ tg_send(){
   if [[ -z "$TELEGRAM_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
     echo "Skip Telegram (token/chat_id not set)"; return 0
   fi
-
-  # 1) Try HTML
   local resp code body
-  resp="$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+
+  # Try HTML mode
+  resp="$(curl -sS -w '\n%{http_code}' -X POST \
+      "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "text=${text}" \
       --data "parse_mode=HTML" \
       --data "disable_web_page_preview=true")"
-  code="$(echo "$resp" | tail -n1)"; body="$(echo "$resp" | sed '$d')"
-  if [[ "$code" == "200" ]]; then echo "Telegram sent (HTML)."; return 0; fi
 
-  # 2) Retry once on 429
+  code="$(echo "$resp" | tail -n1)"
+  body="$(echo "$resp" | sed '$d')"
+
+  [[ "$code" == "200" ]] && { echo "Telegram sent (HTML)"; return 0; }
+
+  # Retry on 429
   if [[ "$code" == "429" ]]; then
-    echo "Telegram rate-limited (429). Retrying in 2s..."
+    echo "Rate limit (429), retrying…"
     sleep 2
-    resp="$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+    resp="$(curl -sS -w '\n%{http_code}' -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
         --data-urlencode "text=${text}" \
         --data "parse_mode=HTML" \
         --data "disable_web_page_preview=true")"
-    code="$(echo "$resp" | tail -n1)"; body="$(echo "$resp" | sed '$d')"
-    if [[ "$code" == "200" ]]; then echo "Telegram sent after retry."; return 0; fi
+    code="$(echo "$resp" | tail -n1)"
+    [[ "$code" == "200" ]] && { echo "Telegram sent after retry"; return 0; }
   fi
 
-  echo "HTML send failed (HTTP $code): $body"
-  echo "Falling back to plain text…"
+  echo "HTML send failed ($code): $body"
+  echo "Trying plain text fallback…"
 
-  # 3) Plain text fallback
-  local plain
+  # plain fallback
   plain="$(echo "$text" | sed 's/<[^>]*>//g')"
-  resp="$(curl -sS -w '\n%{http_code}' -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+  resp="$(curl -sS -w '\n%{http_code}' -X POST \
+      "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "text=${plain}" \
       --data "disable_web_page_preview=true")"
-  code="$(echo "$resp" | tail -n1)"; body="$(echo "$resp" | sed '$d')"
-  if [[ "$code" == "200" ]]; then
-    echo "Telegram sent (plain)."; return 0
-  else
-    echo "Telegram failed (plain) HTTP $code: $body"
-    return 0   # don't break the deploy pipeline
-  fi
+
+  code="$(echo "$resp" | tail -n1)"
+  [[ "$code" == "200" ]] && { echo "Telegram sent (plain)"; return 0; }
+
+  echo "Telegram failed final ($code): $(echo "$resp" | sed '$d')"
 }
 
 enable_api(){
   local api="$1"
   echo "• Ensuring API enabled: $api"
-  gcloud services enable "$api" --quiet >/dev/null 2>&1 || gcloud services enable "$api" --quiet
+  gcloud services enable "$api" --quiet >/dev/null 2>&1 \
+    || gcloud services enable "$api" --quiet
 }
 
 # ===== Checks =====
 need gcloud; need curl
 gcloud --version >/dev/null || abort "gcloud not initialized"
+
 PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
 [[ -z "$PROJECT" || "$PROJECT" == "(unset)" ]] && abort "Run: gcloud config set project <PROJECT_ID>"
 
-# ===== Enable required APIs =====
+# ===== Enable APIs =====
 enable_api "run.googleapis.com"
-# If you need Artifact Registry for images, also enable:
-# enable_api "artifactregistry.googleapis.com"
 
-# ===== Deploy =====
-START_TIME="$(yangon_time)"
-echo "Deploying ${SERVICE} → ${REGION} …"
+# ===== Time Calculation =====
+START_TS="$(yangon_now_epoch)"
+END_TS="$(( START_TS + DURATION_HOURS * 3600 ))"
+
+START_TIME="$(yangon_fmt_epoch "$START_TS")"
+END_TIME="$(yangon_fmt_epoch "$END_TS")"
+
+# ===== Deploy Cloud Run =====
+echo "Deploying ${SERVICE} to ${REGION}…"
 
 gcloud run deploy "$SERVICE" \
   --image "$IMAGE" \
@@ -107,19 +122,19 @@ gcloud run deploy "$SERVICE" \
   --port "$PORT" \
   --set-env-vars "WSPATH=${WSPATH}"
 
-URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')" || abort "Failed to get service URL"
+URL="$(gcloud.run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')" || abort "Failed to read URL"
 HOST="${URL#https://}"
-END_TIME="$(yangon_time)"
 
-# ===== Build payload blocks =====
+# ===== Payload =====
 PAYLOAD="GET ${WSPATH} HTTP/1.1
 Host: ${HOST}
 Connection: Upgrade
 Upgrade: Websocket
 User-Agent: Googlebot/2.1 (+http://www.google.com/bot.html)[crlf][crlf]"
+
 PAYLOAD_ESCAPED="$(echo "$PAYLOAD" | html_escape)"
 
-# ===== Telegram message (Mono + Quote) =====
+# ===== Telegram Message =====
 read -r -d '' MSG <<EOF || true
 ☁️ <b>Google Cloud / Cloud Run SSH</b>
 
@@ -135,7 +150,7 @@ read -r -d '' MSG <<EOF || true
 <blockquote><b>SNI</b></blockquote>
 <pre><code>vpn.googleapis.com</code></pre>
 
-You Can Use Your Country SNI (or) Host.
+You can use your country SNI or host.
 
 <b>URL:</b> ${URL}
 
@@ -145,4 +160,4 @@ EOF
 
 tg_send "$MSG"
 
-echo "Done ✅  URL = $URL"
+echo "✅ Done! URL = $URL"
